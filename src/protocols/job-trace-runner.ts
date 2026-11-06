@@ -153,24 +153,40 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
   }
 
   /**
-   * Returns the options with the active trace id added, or `undefined` when
-   * there is nothing to add.
+   * The fields that hand the active trace on to a job: its id and, with
+   * OpenTelemetry interop on, a W3C `traceparent` for an OpenTelemetry SDK in
+   * the worker's process to continue - see `traceparentToHandOn`.
+   * `undefined` outside a trace.
    *
-   * A repeatable job is left alone: every repetition would otherwise report
-   * under the one request that happened to register the schedule, for as long
-   * as the schedule lives. Those runs are cron firings, and each mints its own
-   * id like any other.
-   *
-   * With OpenTelemetry interop on, a W3C `traceparent` goes beside the id, for
-   * an OpenTelemetry SDK in the worker's process to continue - see
-   * `traceparentToHandOn`.
+   * For a driver whose enqueue path `patchEnqueue` does not fit - pg-boss
+   * carries these in its own trace context column rather than in job options.
    */
-  private stampTraceId(opts: unknown): Record<string, unknown> | undefined {
+  traceFieldsToHandOn(): Record<string, string> | undefined {
     const store = this.asyncLocalStorage.getStore();
     const traceId = store?.get(this.options.traceIdKey);
     if (typeof traceId !== "string") {
       return undefined;
     }
+    const fields: Record<string, string> = { [JOB_TRACE_OPTION_KEY]: traceId };
+    if (this.openTelemetryInteropOn()) {
+      fields[JOB_TRACE_CONTEXT_OPTION_KEY] = traceparentToHandOn(
+        store,
+        traceId,
+      );
+    }
+    return fields;
+  }
+
+  /**
+   * Returns the options with the trace fields added, or `undefined` when
+   * there is nothing to add.
+   *
+   * A repeatable job is left alone: every repetition would otherwise report
+   * under the one request that happened to register the schedule, for as long
+   * as the schedule lives. Those runs are cron firings, and each mints its own
+   * id like any other. Fields the caller set already are kept.
+   */
+  private stampTraceId(opts: unknown): Record<string, unknown> | undefined {
     if (opts !== undefined && (typeof opts !== "object" || opts === null)) {
       return undefined;
     }
@@ -178,20 +194,8 @@ export class JobTraceRunner<Store extends Record<string, unknown>> {
     if (current["repeat"] || current[JOB_TRACE_OPTION_KEY] !== undefined) {
       return undefined;
     }
-    const stamped: Record<string, unknown> = {
-      ...current,
-      [JOB_TRACE_OPTION_KEY]: traceId,
-    };
-    if (
-      this.openTelemetryInteropOn() &&
-      current[JOB_TRACE_CONTEXT_OPTION_KEY] === undefined
-    ) {
-      stamped[JOB_TRACE_CONTEXT_OPTION_KEY] = traceparentToHandOn(
-        store,
-        traceId,
-      );
-    }
-    return stamped;
+    const fields = this.traceFieldsToHandOn();
+    return fields ? { ...fields, ...current } : undefined;
   }
 
   /**

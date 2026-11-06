@@ -1,5 +1,7 @@
+import { Logger } from "@nestjs/common";
 import { AsyncLocalStorage } from "async_hooks";
 import { PgBoss } from "pg-boss";
+import Telemetry, { type TraceCarrier } from "pg-boss/dist/telemetry.js";
 import { OperationTraceRegistry } from "../services/operation-trace.registry.js";
 import { PgBossObserveAgentService } from "./pg-boss-observe-agent.service.js";
 
@@ -11,6 +13,21 @@ const prototype = PgBoss.prototype as unknown as Record<
   unknown
 >;
 const realWork = prototype.work;
+
+const telemetryPrototype = Telemetry.prototype as unknown as Record<
+  string | symbol,
+  unknown
+>;
+const realSend = telemetryPrototype.send;
+const realProcess = telemetryPrototype.process;
+const ORIGINAL_SEND = Symbol.for("nestjs.observe.pgBoss.telemetry.send");
+const ORIGINAL_PROCESS = Symbol.for("nestjs.observe.pgBoss.telemetry.process");
+
+/** pg-boss's own telemetry, as a PgBoss client builds it - no database needed. */
+const telemetry = (enabled = true) =>
+  new Telemetry({ enabled }, "pgboss", () => null);
+
+type Carrier = TraceCarrier | null;
 
 /**
  * Stands in for pg-boss's own `work`, which needs a started client and a
@@ -59,6 +76,10 @@ const work = (...args: unknown[]) =>
 afterEach(() => {
   prototype.work = realWork;
   delete prototype[ORIGINAL_WORK];
+  telemetryPrototype.send = realSend;
+  telemetryPrototype.process = realProcess;
+  delete telemetryPrototype[ORIGINAL_SEND];
+  delete telemetryPrototype[ORIGINAL_PROCESS];
   vi.restoreAllMocks();
 });
 
@@ -190,5 +211,199 @@ describe("PgBossObserveAgentService", () => {
     work("emails", async () => undefined);
 
     expect(original).toHaveBeenCalledOnce();
+  });
+
+  it("hands a transactional worker's db to the handler", async () => {
+    const original = stubOriginalWork();
+    createAgent();
+    const handler = vi.fn(async () => undefined);
+    work("emails", { transactional: true }, handler);
+
+    const jobs = [{ id: "job-1", name: "emails" }];
+    const db = { executeSql: vi.fn() };
+    await (handlerPassedTo(original) as (...args: unknown[]) => unknown)(
+      jobs,
+      db,
+    );
+
+    expect(handler).toHaveBeenCalledWith(jobs, db);
+  });
+
+  it("starts the worker outside the context work() was called in", () => {
+    const original = stubOriginalWork();
+    const { als } = createAgent();
+    let storeSeenByPgBoss: unknown = "unset";
+    original.mockImplementation(() => {
+      storeSeenByPgBoss = als.getStore();
+      return "worker-id";
+    });
+
+    als.run(new Map([["traceId", "registering-request"]]), () =>
+      work("emails", async () => undefined),
+    );
+
+    expect(storeSeenByPgBoss).toBeUndefined();
+  });
+
+  describe("enqueueing", () => {
+    it("adds the active trace id to the trace context pg-boss persists", async () => {
+      const { als } = createAgent();
+      let persisted: Carrier = null;
+
+      await als.run(new Map([["traceId", "request-trace-1"]]), () =>
+        telemetry().send("send", "emails", 1, async (carrier) => {
+          persisted = carrier;
+          return "job-id";
+        }),
+      );
+
+      expect(persisted).toEqual({ observeTraceId: "request-trace-1" });
+    });
+
+    it("keeps what OpenTelemetry injected beside the trace id", async () => {
+      // pg-boss injects a W3C context only with an SDK registered and
+      // propagateContext on; this stands in for that carrier, parked where
+      // the agent will find it as pg-boss's own send.
+      telemetryPrototype[ORIGINAL_SEND] = function (
+        this: unknown,
+        ...args: unknown[]
+      ) {
+        const fn = args[3] as (carrier: Carrier) => unknown;
+        return fn({ traceparent: "00-otel-span-01" });
+      };
+      const { als } = createAgent();
+      let persisted: Carrier = null;
+
+      await als.run(new Map([["traceId", "request-trace-1"]]), () =>
+        telemetry().send("send", "emails", 1, async (carrier) => {
+          persisted = carrier;
+        }),
+      );
+
+      expect(persisted).toEqual({
+        traceparent: "00-otel-span-01",
+        observeTraceId: "request-trace-1",
+      });
+    });
+
+    it("leaves a job enqueued outside any trace without a carrier", async () => {
+      createAgent();
+      let persisted: Carrier = { untouched: "true" };
+
+      await telemetry().send("send", "emails", 1, async (carrier) => {
+        persisted = carrier;
+      });
+
+      expect(persisted).toBeNull();
+    });
+
+    it("warns once, and stamps nothing, when pg-boss telemetry is disabled", async () => {
+      const warn = vi.spyOn(Logger.prototype, "warn");
+      const { als } = createAgent();
+      const persisted: Carrier[] = [];
+
+      await als.run(new Map([["traceId", "request-trace-1"]]), async () => {
+        for (let i = 0; i < 2; i++) {
+          await telemetry(false).send("send", "emails", 1, async (c) => {
+            persisted.push(c);
+          });
+        }
+      });
+
+      expect(persisted).toEqual([null, null]);
+      expect(
+        warn.mock.calls.filter(([message]) =>
+          String(message).includes("openTelemetry.enabled false"),
+        ),
+      ).toHaveLength(1);
+    });
+  });
+
+  describe("running", () => {
+    const runThroughTelemetry = (
+      jobs: { id: string; name: string }[],
+      carrierOf: () => TraceCarrier | undefined,
+      handler: Handler,
+    ) =>
+      telemetry().process("emails", jobs, carrierOf, async () => handler(jobs));
+
+    it("runs a job under the trace id it was enqueued with", async () => {
+      const original = stubOriginalWork();
+      const { als, reported, endTrace } = createAgent();
+      let traceId: unknown;
+      work("emails", async () => {
+        traceId = als.getStore()?.get("traceId");
+      });
+
+      await runThroughTelemetry(
+        [{ id: "job-1", name: "emails" }],
+        () => ({ observeTraceId: "request-trace-1" }),
+        handlerPassedTo(original),
+      );
+
+      expect(traceId).toBe("request-trace-1");
+      await vi.waitFor(() => expect(endTrace).toHaveBeenCalledOnce());
+      expect(reported().snapshot).toMatchObject({ id: "job-1" });
+      expect(reported().status).toBe("completed");
+    });
+
+    it("mints its own id for a carried id that is not a plausible trace id", async () => {
+      const original = stubOriginalWork();
+      const { als } = createAgent();
+      let traceId: unknown;
+      work("emails", async () => {
+        traceId = als.getStore()?.get("traceId");
+      });
+
+      await runThroughTelemetry(
+        [{ id: "job-1", name: "emails" }],
+        () => ({ observeTraceId: "x".repeat(500) }),
+        handlerPassedTo(original),
+      );
+
+      expect(traceId).toEqual(expect.any(String));
+      expect(traceId).not.toBe("x".repeat(500));
+    });
+
+    it("gives a batch a trace of its own, whatever its jobs carried", async () => {
+      const original = stubOriginalWork();
+      const { als } = createAgent();
+      let traceId: unknown;
+      work("emails", { batchSize: 2 }, async () => {
+        traceId = als.getStore()?.get("traceId");
+      });
+
+      await runThroughTelemetry(
+        [
+          { id: "a", name: "emails" },
+          { id: "b", name: "emails" },
+        ],
+        () => ({ observeTraceId: "request-trace-1" }),
+        handlerPassedTo(original),
+      );
+
+      expect(traceId).toEqual(expect.any(String));
+      expect(traceId).not.toBe("request-trace-1");
+    });
+
+    it("runs a job outside whatever trace its worker loop inherited", async () => {
+      const original = stubOriginalWork();
+      const { als } = createAgent();
+      let traceId: unknown;
+      work("emails", async () => {
+        traceId = als.getStore()?.get("traceId");
+      });
+
+      await als.run(new Map([["traceId", "registering-request"]]), () =>
+        runThroughTelemetry(
+          [{ id: "job-1", name: "emails" }],
+          () => undefined,
+          handlerPassedTo(original),
+        ),
+      );
+
+      expect(traceId).toEqual(expect.any(String));
+      expect(traceId).not.toBe("registering-request");
+    });
   });
 });
