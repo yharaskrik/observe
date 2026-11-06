@@ -628,6 +628,7 @@ Protocol integrations are only loaded when you use them, and their packages are 
 - `@nestjs/bullmq` and `bullmq` - queue/job instrumentation
 - `@taskforcesh/bullmq-pro` - the same, for BullMQ Pro, whether it is wired in through `@taskforcesh/nestjs-bullmq-pro` or through `@nestjs/bullmq` (`BullModule.workerClass = WorkerPro`)
 - `@nestjs/bull` and `bull` - the same, for legacy Bull
+- `pg-boss` - the same, for pg-boss 12 workers registered with `boss.work()`. Each handler call is one run: a batch of one (the default) reports as that job, with wait time and attempts when the worker sets `includeMetadata: true`; a larger batch reports as one run of the queue. pg-boss jobs do not yet carry the enqueuing request's trace id
 - `@nestjs/websockets` - WebSocket gateway instrumentation (`ws` and socket.io adapters)
 - `@nestjs/schedule` - scheduled job (`@Cron`, `@Interval`, `@Timeout`) instrumentation
 
