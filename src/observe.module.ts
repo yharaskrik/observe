@@ -36,6 +36,7 @@ import {
   uninstallLlmFetchObserver,
 } from "./outgoing/llm/llm-fetch.integration.js";
 import { BullObserveAgentService } from "./protocols/bull-observe-agent.service.js";
+import { PgBossObserveAgentService } from "./protocols/pg-boss-observe-agent.service.js";
 import { QueueObserveAgentService } from "./protocols/queue-observe-agent.service.js";
 import { RpcObserveAgentService } from "./protocols/rpc-observe-agent.service.js";
 import { ScheduleObserveAgentService } from "./protocols/schedule-observe-agent.service.js";
@@ -276,6 +277,8 @@ export function createObserveModule<Store extends Record<string, unknown>>(
       QueueObserveAgentService,
       // A no-op unless bull - the driver behind @nestjs/bull - is installed.
       BullObserveAgentService,
+      // A no-op unless pg-boss is installed.
+      PgBossObserveAgentService,
       // A no-op unless @nestjs/schedule is installed; it patches the explorer
       // from its constructor so the patch lands before any handler is found.
       ScheduleObserveAgentService,
@@ -426,6 +429,7 @@ export function createObserveModule<Store extends Record<string, unknown>>(
         instance instanceof GraphQLObserveAgentService ||
         // Same reason: its wrapper runs inside the job traces it opens.
         instance instanceof ScheduleObserveAgentService ||
+        instance instanceof PgBossObserveAgentService ||
         instance instanceof WsObserveAgentService ||
         instance instanceof OutgoingObserveAgentService ||
         // Handed every finished operation from inside its completion: agent
